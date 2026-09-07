@@ -430,8 +430,6 @@ class MirtekCC1101 : public PollingComponent,
     }
   }
 
-  bool verify_frame_(uint8_t command, size_t expected_len);
-
   void start_request_(uint8_t idx) {
     request_index_ = idx;
     received_packets_ = 0;
@@ -592,34 +590,6 @@ class MirtekCC1101 : public PollingComponent,
       return false;
     }
     return true;
-  }
-
-  bool do_request_(uint8_t command, int sub1, int sub2, uint8_t packet_count) {
-    size_t raw_len = build_request_(command, sub1, sub2);
-    send_packet_(raw_len);
-
-    raw_joined_len_ = 0;
-    uint8_t pkt[64]{};
-    uint8_t got = 0;
-    uint32_t start = millis();
-
-    while (millis() - start < 10000UL && got < packet_count) {
-      size_t n = read_one_air_packet_(pkt, sizeof(pkt), 2500);
-      if (!n) continue;
-      // Arduino code deliberately skips the packet's length byte.
-      for (size_t i = 0; i < n && raw_joined_len_ < sizeof(raw_joined_); i++) {
-        raw_joined_[raw_joined_len_++] = pkt[i];
-      }
-      got++;
-    }
-
-    if (got != packet_count) {
-      ESP_LOGW(TAG, "cmd=0x%02X: получено подпакетов %u/%u", command, got, packet_count);
-      return false;
-    }
-
-    destuff_joined_();
-    return result_len_ >= 4;
   }
 
   bool parse_datetime_() {
