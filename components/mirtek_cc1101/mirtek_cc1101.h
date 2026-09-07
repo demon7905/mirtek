@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <string>
 
 namespace esphome {
 namespace mirtek_cc1101 {
@@ -117,12 +118,21 @@ class MirtekCC1101 : public PollingComponent,
   void dump_config() override {
     ESP_LOGCONFIG(TAG, "Mirtek-32-RU CC1101:");
     ESP_LOGCONFIG(TAG, "  Адрес счётчика: %u", address_);
-    ESP_LOGCONFIG(TAG, "  Интервал опроса: %u ms", this->get_update_interval());
+    ESP_LOGCONFIG(TAG, "  Интервал опроса: %lu ms",
+                  static_cast<unsigned long>(this->get_update_interval()));
     LOG_PIN("  GDO0: ", gdo0_);
   }
 
   void update() override {
-    poll_all_();
+    if (poll_active_) {
+      ESP_LOGW(TAG, "Опрос уже выполняется, пропускаем новый UPDATE");
+      return;
+    }
+    start_cycle_();
+  }
+
+  void loop() override {
+    service_poll_();
   }
 
  protected:
@@ -139,6 +149,19 @@ class MirtekCC1101 : public PollingComponent,
   uint8_t result_[64]{};
   size_t raw_joined_len_{0};
   size_t result_len_{0};
+
+  // Non-blocking poll state. The Arduino firmware waits in packetReceiver(),
+  // but ESPHome must return from loop()/update() quickly to avoid the task WDT.
+  bool poll_active_{false};
+  uint8_t request_index_{0};
+  uint8_t expected_packets_{0};
+  uint8_t received_packets_{0};
+  bool cycle_ok_{true};
+  uint32_t request_deadline_{0};
+  uint8_t rx_frame_[65]{};
+  uint8_t rx_frame_len_{0};
+  uint8_t rx_pos_{0};
+  bool rx_started_{false};
 
   void publish_(int i, float v) {
     if (i >= 0 && i < SI_COUNT && sensors_[i]) sensors_[i]->publish_state(v);
@@ -270,16 +293,19 @@ class MirtekCC1101 : public PollingComponent,
   }
 
   void send_packet_(size_t raw_len) {
-    uint8_t tx[48]{};
+    uint8_t tx[64]{};
     size_t tx_len = stuff_packet_(tx_raw_, raw_len, tx, sizeof(tx));
-    if (!tx_len) return;
+    if (!tx_len) {
+      ESP_LOGE(TAG, "Не удалось сформировать TX packet");
+      return;
+    }
 
-    // Same critical sequence as the working Arduino firmware.
+    // Exactly the sequence used by the known-working Arduino firmware.
     strobe_(CC_SCAL);
     delay(1);
     strobe_(CC_SFTX);
     strobe_(CC_SIDLE);
-    write_reg_(CC_PA, 0xC4);  // +10 dBm table value used by working firmware.
+    write_reg_(CC_PA, 0xC4);
 
     enable_();
     this->transfer_byte(CC_TXFIFO | 0x40);
@@ -288,61 +314,246 @@ class MirtekCC1101 : public PollingComponent,
     strobe_(CC_STX);
 
     ESP_LOGD(TAG, "TX len=%u", static_cast<unsigned>(tx_len));
+    if (tx_len <= 64) {
+      std::string hex;
+      char tmp[4];
+      for (size_t i = 1; i < tx_len; i++) {
+        snprintf(tmp, sizeof(tmp), "%02X ", tx[i]);
+        hex += tmp;
+      }
+      ESP_LOGVV(TAG, "TX RAW: %s", hex.c_str());
+    }
 
-    // Leave receiver active exactly as in the Arduino code after TX.
     delay(2);
     strobe_(CC_SFRX);
     strobe_(CC_SRX);
   }
 
-  // Read one CC1101 variable-length packet, excluding the length byte.
-  size_t read_one_air_packet_(uint8_t *dst, size_t cap, uint32_t timeout_ms) {
-    uint32_t start = millis();
-    while (millis() - start < timeout_ms) {
-      uint8_t n = read_status_(CC_RXBYTES) & 0x7F;
-      if (n == 0) {
-        delayMicroseconds(500);
-        continue;
-      }
-      if (n > 64) {
-        strobe_(CC_SIDLE);
-        strobe_(CC_SFRX);
-        strobe_(CC_SRX);
-        continue;
-      }
+  bool read_fifo_byte_(uint8_t &v) {
+    if ((read_status_(CC_RXBYTES) & 0x7F) == 0) return false;
+    enable_();
+    this->transfer_byte(CC_RXFIFO | 0x80 | 0x40);
+    v = this->transfer_byte(0x00);
+    disable_();
+    return true;
+  }
 
-      // CC1101 is configured for variable-length packets. RXBYTES may become
-      // non-zero as soon as the first byte arrives, so give the radio time to
-      // receive the complete packet before reading the FIFO.
-      delay(8);
-      uint8_t n2 = read_status_(CC_RXBYTES) & 0x7F;
-      if (n2 == 0) continue;
+  void rearm_rx_() {
+    strobe_(CC_SIDLE);
+    strobe_(CC_SFRX);
+    strobe_(CC_SFTX);
+    strobe_(CC_SRX);
+  }
 
-      enable_();
-      this->transfer_byte(CC_RXFIFO | 0x80 | 0x40);
-      uint8_t packet_len = this->transfer_byte(0x00);
-      if (packet_len == 0 || packet_len > 63 || n2 < static_cast<uint8_t>(packet_len + 1) || packet_len > cap) {
-        disable_();
-        strobe_(CC_SIDLE);
-        strobe_(CC_SFRX);
-        strobe_(CC_SRX);
-        continue;
-      }
-
-      size_t payload_len = packet_len;
-      if (payload_len > cap) payload_len = cap;
-      for (size_t i = 0; i < payload_len; i++) dst[i] = this->transfer_byte(0x00);
-      // Drain anything left in this FIFO packet if our buffer was smaller.
-      for (size_t i = payload_len; i < packet_len; i++) (void)this->transfer_byte(0x00);
-      disable_();
-
-      strobe_(CC_SIDLE);
-      strobe_(CC_SFRX);
-      strobe_(CC_SFTX);
-      strobe_(CC_SRX);
-      return payload_len;
+  void dump_rx_packet_() {
+    char hex[65 * 3 + 1]{};
+    size_t p = 0;
+    for (uint8_t i = 0; i < rx_frame_len_ && p + 3 < sizeof(hex); i++) {
+      p += snprintf(hex + p, sizeof(hex) - p, "%02X ", rx_frame_[i]);
     }
-    return 0;
+    ESP_LOGVV(TAG, "RX RAW (%u): %s", rx_frame_len_, hex);
+  }
+
+  bool append_received_packet_() {
+    // ELECHOUSE ReceiveData() gives buffer[0] as the packet length and returns
+    // that length. The original Arduino code appends buffer[1]..buffer[len-1],
+    // deliberately dropping the final byte of every RF sub-packet. Reproduce
+    // that behavior exactly here.
+    if (rx_frame_len_ < 3) return false;
+
+    const size_t append_len = static_cast<size_t>(rx_frame_len_ - 1);
+    if (raw_joined_len_ + append_len > sizeof(raw_joined_)) {
+      ESP_LOGW(TAG, "Слишком большой объединённый RX буфер");
+      return false;
+    }
+    for (size_t i = 1; i < rx_frame_len_; i++) {
+      raw_joined_[raw_joined_len_++] = rx_frame_[i];
+    }
+    received_packets_++;
+    ESP_LOGD(TAG, "RX подпакет %u/%u, %u байт", received_packets_,
+             expected_packets_, rx_frame_len_ - 1);
+    return true;
+  }
+
+  void reset_rx_packet_() {
+    rx_frame_len_ = 0;
+    rx_pos_ = 0;
+    rx_started_ = false;
+  }
+
+  void service_rx_() {
+    // Read the variable-length CC1101 packet incrementally, one or a few bytes
+    // per ESPHome loop pass. No long blocking wait here.
+    uint8_t available = read_status_(CC_RXBYTES) & 0x7F;
+    if (available == 0) return;
+
+    while (available > 0) {
+      uint8_t b = 0;
+      if (!read_fifo_byte_(b)) return;
+
+      if (!rx_started_) {
+        rx_started_ = true;
+        rx_frame_[0] = b;
+        rx_frame_len_ = 1;
+        rx_pos_ = 1;
+        if (b == 0 || b > 63) {
+          ESP_LOGW(TAG, "Некорректная длина CC1101 RX: %u", b);
+          reset_rx_packet_();
+          rearm_rx_();
+          return;
+        }
+      } else if (rx_pos_ < sizeof(rx_frame_)) {
+        rx_frame_[rx_pos_++] = b;
+        rx_frame_len_ = rx_pos_;
+      } else {
+        ESP_LOGW(TAG, "RX frame buffer переполнен");
+        reset_rx_packet_();
+        rearm_rx_();
+        return;
+      }
+
+      available = read_status_(CC_RXBYTES) & 0x7F;
+      if (rx_started_ && rx_pos_ >= static_cast<uint8_t>(rx_frame_[0] + 1)) {
+        dump_rx_packet_();
+        bool ok = append_received_packet_();
+        reset_rx_packet_();
+        rearm_rx_();
+        if (!ok) {
+          complete_request_(false);
+          return;
+        }
+        if (received_packets_ >= expected_packets_) {
+          complete_request_(true);
+        }
+        return;
+      }
+    }
+  }
+
+  bool verify_frame_(uint8_t command, size_t expected_len);
+
+  void start_request_(uint8_t idx) {
+    request_index_ = idx;
+    received_packets_ = 0;
+    raw_joined_len_ = 0;
+    result_len_ = 0;
+    reset_rx_packet_();
+
+    uint8_t cmd = 0;
+    int sub1 = -1;
+    int sub2 = -1;
+    expected_packets_ = 4;
+
+    switch (request_index_) {
+      case 0:
+        cmd = 0x1C;
+        expected_packets_ = 3;
+        break;
+      case 1:
+        cmd = 0x05;
+        sub1 = 0x00;
+        expected_packets_ = 4;
+        break;
+      case 2:
+        cmd = 0x2B;
+        sub1 = 0x00;
+        expected_packets_ = 4;
+        break;
+      case 3:
+        cmd = 0x2B;
+        sub1 = 0x10;
+        expected_packets_ = 4;
+        break;
+      default:
+        return;
+    }
+
+    size_t raw_len = build_request_(cmd, sub1, sub2);
+    send_packet_(raw_len);
+    request_deadline_ = millis() + 10000UL;
+    poll_active_ = true;
+
+    ESP_LOGI(TAG, "Запрос %u/4: cmd=0x%02X, ожидаю %u подпакета(ов)",
+             static_cast<unsigned>(request_index_ + 1), cmd, expected_packets_);
+  }
+
+  void start_cycle_() {
+    poll_active_ = false;
+    cycle_ok_ = true;
+    request_index_ = 0;
+    ESP_LOGI(TAG, "=== Опрос МИРТЕК-32-РУ, адрес=%u ===", address_);
+    start_request_(0);
+  }
+
+  void complete_request_(bool transport_ok) {
+    if (!poll_active_) return;
+
+    bool parsed_ok = false;
+    if (transport_ok) {
+      destuff_joined_();
+      switch (request_index_) {
+        case 0:
+          parsed_ok = parse_datetime_();
+          break;
+        case 1:
+          parsed_ok = parse_energy_();
+          break;
+        case 2:
+          parsed_ok = parse_instant_3ph_();
+          break;
+        case 3:
+          parsed_ok = parse_phase_power_();
+          break;
+        default:
+          parsed_ok = false;
+          break;
+      }
+
+      if (parsed_ok) {
+        ESP_LOGI(TAG, "Запрос %u/4: OK", static_cast<unsigned>(request_index_ + 1));
+      } else {
+        ESP_LOGW(TAG, "Запрос %u/4: RX есть, но пакет не прошёл проверку/парсинг",
+                 static_cast<unsigned>(request_index_ + 1));
+      }
+    } else {
+      ESP_LOGW(TAG, "Запрос %u/4: таймаут/ошибка RX, подпакетов %u/%u",
+               static_cast<unsigned>(request_index_ + 1), received_packets_, expected_packets_);
+    }
+
+    cycle_ok_ = cycle_ok_ && transport_ok && parsed_ok;
+    poll_active_ = false;
+
+    if (request_index_ < 3) {
+      // Small gap between Mirtek requests, matching the Arduino's sequential
+      // send/receive cycle while keeping ESPHome's loop responsive.
+      request_index_++;
+      poll_active_ = false;
+      request_deadline_ = millis() + 100;
+    } else {
+      publish_txt_(TI_LAST_RESPONSE, cycle_ok_ ? "OK" : "PARTIAL");
+      ESP_LOGI(TAG, "=== Опрос завершён: %s ===", cycle_ok_ ? "OK" : "PARTIAL");
+    }
+  }
+
+  void service_poll_() {
+    if (!poll_active_) {
+      // request_index_ is advanced by complete_request_ and a short delay is
+      // used as a non-blocking gap between sequential requests.
+      if (request_index_ > 0 && request_index_ < 4 &&
+          static_cast<int32_t>(millis() - request_deadline_) >= 0) {
+        start_request_(request_index_);
+      }
+      return;
+    }
+
+    if (static_cast<int32_t>(millis() - request_deadline_) >= 0) {
+      reset_rx_packet_();
+      rearm_rx_();
+      complete_request_(false);
+      return;
+    }
+
+    service_rx_();
   }
 
   void destuff_joined_() {
@@ -495,23 +706,6 @@ class MirtekCC1101 : public PollingComponent,
     return true;
   }
 
-  void poll_all_() {
-    ESP_LOGI(TAG, "=== Опрос МИРТЕК-32-РУ, адрес=%u ===", address_);
-
-    bool ok1 = do_request_(0x1C, -1, -1, 3) && parse_datetime_();
-    bool ok2 = do_request_(0x05, 0x00, -1, 4) && parse_energy_();
-    bool ok3 = do_request_(0x2B, 0x00, -1, 4) &&
-               (three_phase_ ? parse_instant_3ph_() : parse_instant_3ph_());
-
-    bool ok4 = true;
-    if (three_phase_) {
-      ok4 = do_request_(0x2B, 0x10, -1, 4) && parse_phase_power_();
-    }
-
-    bool all = ok1 && ok2 && ok3 && ok4;
-    publish_txt_(TI_LAST_RESPONSE, all ? "OK" : "PARTIAL");
-    ESP_LOGI(TAG, "=== Опрос завершён: %s ===", all ? "OK" : "PARTIAL");
-  }
 };
 
 }  // namespace mirtek_cc1101
