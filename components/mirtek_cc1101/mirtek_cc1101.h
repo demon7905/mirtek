@@ -162,6 +162,10 @@ class MirtekCC1101 : public PollingComponent,
   uint8_t rx_frame_len_{0};
   uint8_t rx_pos_{0};
   bool rx_started_{false};
+  bool gdo0_seen_high_{false};
+  bool tx_active_{false};
+  uint32_t tx_deadline_{0};
+  uint8_t cycle_request_{0};
 
   void publish_(int i, float v) {
     if (i >= 0 && i < SI_COUNT && sensors_[i]) sensors_[i]->publish_state(v);
@@ -300,7 +304,10 @@ class MirtekCC1101 : public PollingComponent,
       return;
     }
 
-    // Exactly the sequence used by the known-working Arduino firmware.
+    // Match ELECHOUSE SendData()/the working Arduino as closely as possible:
+    // calibrate, flush TX, enter IDLE, set PA table, load TX FIFO, STX, then
+    // wait asynchronously for GDO0 to go HIGH and LOW (sync transmitted /
+    // end of packet). Only after TX is finished do we flush and enter RX.
     strobe_(CC_SCAL);
     delay(1);
     strobe_(CC_SFTX);
@@ -311,6 +318,11 @@ class MirtekCC1101 : public PollingComponent,
     this->transfer_byte(CC_TXFIFO | 0x40);
     for (size_t i = 0; i < tx_len; i++) this->transfer_byte(tx[i]);
     disable_();
+
+    if (gdo0_) gdo0_seen_high_ = gdo0_->digital_read();
+    else gdo0_seen_high_ = false;
+    tx_deadline_ = millis() + 500UL;
+    tx_active_ = true;
     strobe_(CC_STX);
 
     ESP_LOGD(TAG, "TX len=%u", static_cast<unsigned>(tx_len));
@@ -323,35 +335,122 @@ class MirtekCC1101 : public PollingComponent,
       }
       ESP_LOGVV(TAG, "TX RAW: %s", hex.c_str());
     }
-
-    delay(2);
-    strobe_(CC_SFRX);
-    strobe_(CC_SRX);
   }
 
-  bool read_fifo_byte_(uint8_t &v) {
-    if ((read_status_(CC_RXBYTES) & 0x7F) == 0) return false;
+  uint8_t read_reg_(uint8_t reg) {
     enable_();
-    this->transfer_byte(CC_RXFIFO | 0x80 | 0x40);
-    v = this->transfer_byte(0x00);
+    this->transfer_byte(reg & 0x3F | 0x80);  // READ_SINGLE
+    uint8_t v = this->transfer_byte(0x00);
     disable_();
-    return true;
+    return v;
   }
 
-  void rearm_rx_() {
-    strobe_(CC_SIDLE);
-    strobe_(CC_SFRX);
-    strobe_(CC_SFTX);
-    strobe_(CC_SRX);
+  void read_burst_(uint8_t reg, uint8_t *data, size_t len) {
+    enable_();
+    this->transfer_byte((reg & 0x3F) | 0xC0);  // READ_BURST
+    for (size_t i = 0; i < len; i++) data[i] = this->transfer_byte(0x00);
+    disable_();
   }
 
-  void dump_rx_packet_() {
-    char hex[65 * 3 + 1]{};
-    size_t p = 0;
-    for (uint8_t i = 0; i < rx_frame_len_ && p + 3 < sizeof(hex); i++) {
-      p += snprintf(hex + p, sizeof(hex) - p, "%02X ", rx_frame_[i]);
+  bool read_fifo_packet_like_elechouse_() {
+    // Mirrors ELECHOUSE_CC1101::ReceiveData() as closely as possible:
+    //   RXBYTES check -> single-read length byte -> burst-read payload ->
+    //   burst-read 2 status bytes -> SFRX -> return length.
+    uint8_t rxbytes = read_status_(CC_RXBYTES) & 0x7F;
+    if (rxbytes == 0) {
+      strobe_(CC_SFRX);
+      return false;
     }
-    ESP_LOGVV(TAG, "RX RAW (%u): %s", rx_frame_len_, hex);
+
+    uint8_t size = read_reg_(CC_RXFIFO);
+    if (size == 0 || size > 61) {
+      ESP_LOGW(TAG, "ELECHOUSE RX: некорректная длина %u (RXBYTES=%u)", size, rxbytes);
+      strobe_(CC_SFRX);
+      return false;
+    }
+    if (size > sizeof(rx_frame_) - 1) {
+      ESP_LOGW(TAG, "ELECHOUSE RX: пакет %u байт не помещается в буфер", size);
+      strobe_(CC_SFRX);
+      return false;
+    }
+
+    rx_frame_[0] = size;
+    read_burst_(CC_RXFIFO, &rx_frame_[1], size);
+
+    // The original ELECHOUSE code reads/discards two appended status bytes.
+    // The Mirtek RF configuration may not append them, but doing the exact
+    // read is harmless and keeps the transaction sequence compatible.
+    uint8_t status[2]{};
+    read_burst_(CC_RXFIFO, status, 2);
+
+    rx_frame_len_ = static_cast<uint8_t>(size + 1);
+    dump_rx_packet_();
+    bool ok = append_received_packet_();
+    strobe_(CC_SFRX);
+    return ok;
+  }
+
+  void enter_rx_() {
+    strobe_(CC_SFTX);
+    strobe_(CC_SFRX);
+    strobe_(CC_SRX);
+    gdo0_seen_high_ = false;
+    reset_rx_packet_();
+  }
+
+  void service_tx_() {
+    if (!tx_active_) return;
+
+    bool high = gdo0_ ? gdo0_->digital_read() : false;
+    if (high) gdo0_seen_high_ = true;
+
+    // ELECHOUSE SendData waits for GDO0 HIGH, then LOW.
+    if (gdo0_seen_high_ && !high) {
+      tx_active_ = false;
+      strobe_(CC_SFTX);
+      enter_rx_();
+      request_deadline_ = millis() + 2000UL;
+      ESP_LOGVV(TAG, "TX complete (GDO0 HIGH->LOW), RX armed");
+      return;
+    }
+
+    if (static_cast<int32_t>(millis() - tx_deadline_) >= 0) {
+      tx_active_ = false;
+      ESP_LOGW(TAG, "TX timeout: GDO0 не прошёл HIGH->LOW");
+      strobe_(CC_SFTX);
+      enter_rx_();
+      request_deadline_ = millis() + 2000UL;
+    }
+  }
+
+  void service_rx_() {
+    if (tx_active_) return;
+
+    bool high = gdo0_ ? gdo0_->digital_read() : false;
+
+    // Match CheckReceiveFlag(): flag becomes true when GDO0 is HIGH, and the
+    // actual FIFO read is performed only after GDO0 returns LOW.
+    if (high) {
+      gdo0_seen_high_ = true;
+      return;
+    }
+    if (!gdo0_seen_high_) return;
+
+    gdo0_seen_high_ = false;
+    if (!read_fifo_packet_like_elechouse_()) {
+      if (received_packets_ < expected_packets_) {
+        request_deadline_ = millis() + 300UL;
+      }
+      return;
+    }
+
+    if (received_packets_ >= expected_packets_) {
+      complete_request_(true);
+    } else {
+      // Next radio sub-packet must arrive shortly after the previous one.
+      request_deadline_ = millis() + 300UL;
+      enter_rx_();
+    }
   }
 
   bool append_received_packet_() {
@@ -379,55 +478,7 @@ class MirtekCC1101 : public PollingComponent,
     rx_frame_len_ = 0;
     rx_pos_ = 0;
     rx_started_ = false;
-  }
-
-  void service_rx_() {
-    // Read the variable-length CC1101 packet incrementally, one or a few bytes
-    // per ESPHome loop pass. No long blocking wait here.
-    uint8_t available = read_status_(CC_RXBYTES) & 0x7F;
-    if (available == 0) return;
-
-    while (available > 0) {
-      uint8_t b = 0;
-      if (!read_fifo_byte_(b)) return;
-
-      if (!rx_started_) {
-        rx_started_ = true;
-        rx_frame_[0] = b;
-        rx_frame_len_ = 1;
-        rx_pos_ = 1;
-        if (b == 0 || b > 63) {
-          ESP_LOGW(TAG, "Некорректная длина CC1101 RX: %u", b);
-          reset_rx_packet_();
-          rearm_rx_();
-          return;
-        }
-      } else if (rx_pos_ < sizeof(rx_frame_)) {
-        rx_frame_[rx_pos_++] = b;
-        rx_frame_len_ = rx_pos_;
-      } else {
-        ESP_LOGW(TAG, "RX frame buffer переполнен");
-        reset_rx_packet_();
-        rearm_rx_();
-        return;
-      }
-
-      available = read_status_(CC_RXBYTES) & 0x7F;
-      if (rx_started_ && rx_pos_ >= static_cast<uint8_t>(rx_frame_[0] + 1)) {
-        dump_rx_packet_();
-        bool ok = append_received_packet_();
-        reset_rx_packet_();
-        rearm_rx_();
-        if (!ok) {
-          complete_request_(false);
-          return;
-        }
-        if (received_packets_ >= expected_packets_) {
-          complete_request_(true);
-        }
-        return;
-      }
-    }
+    gdo0_seen_high_ = false;
   }
 
   void start_request_(uint8_t idx) {
@@ -468,8 +519,8 @@ class MirtekCC1101 : public PollingComponent,
 
     size_t raw_len = build_request_(cmd, sub1, sub2);
     send_packet_(raw_len);
-    request_deadline_ = millis() + 10000UL;
     poll_active_ = true;
+    request_deadline_ = millis() + 2000UL;
 
     ESP_LOGI(TAG, "Запрос %u/4: cmd=0x%02X, ожидаю %u подпакета(ов)",
              static_cast<unsigned>(request_index_ + 1), cmd, expected_packets_);
@@ -530,6 +581,10 @@ class MirtekCC1101 : public PollingComponent,
     } else {
       publish_txt_(TI_LAST_RESPONSE, cycle_ok_ ? "OK" : "PARTIAL");
       ESP_LOGI(TAG, "=== Опрос завершён: %s ===", cycle_ok_ ? "OK" : "PARTIAL");
+      // Mark the cycle as finished. PollingComponent::update() will start the
+      // next cycle at the configured update interval; do not restart request 4
+      // on every loop() pass.
+      request_index_ = 4;
     }
   }
 
@@ -541,6 +596,11 @@ class MirtekCC1101 : public PollingComponent,
           static_cast<int32_t>(millis() - request_deadline_) >= 0) {
         start_request_(request_index_);
       }
+      return;
+    }
+
+    if (tx_active_) {
+      service_tx_();
       return;
     }
 
