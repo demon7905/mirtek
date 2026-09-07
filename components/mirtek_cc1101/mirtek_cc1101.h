@@ -339,7 +339,7 @@ class MirtekCC1101 : public PollingComponent,
 
   uint8_t read_reg_(uint8_t reg) {
     enable_();
-    this->transfer_byte(reg & 0x3F | 0x80);  // READ_SINGLE
+    this->transfer_byte((reg & 0x3F) | 0x80);  // READ_SINGLE
     uint8_t v = this->transfer_byte(0x00);
     disable_();
     return v;
@@ -350,6 +350,24 @@ class MirtekCC1101 : public PollingComponent,
     this->transfer_byte((reg & 0x3F) | 0xC0);  // READ_BURST
     for (size_t i = 0; i < len; i++) data[i] = this->transfer_byte(0x00);
     disable_();
+  }
+
+  void dump_rx_packet_() {
+    if (rx_frame_len_ == 0) return;
+    std::string hex;
+    char tmp[4];
+    for (size_t i = 0; i < rx_frame_len_; i++) {
+      snprintf(tmp, sizeof(tmp), "%02X ", rx_frame_[i]);
+      hex += tmp;
+    }
+    ESP_LOGVV(TAG, "RX RAW: %s", hex.c_str());
+  }
+
+  void rearm_rx_() {
+    strobe_(CC_SIDLE);
+    strobe_(CC_SFRX);
+    strobe_(CC_SRX);
+    gdo0_seen_high_ = false;
   }
 
   bool read_fifo_packet_like_elechouse_() {
