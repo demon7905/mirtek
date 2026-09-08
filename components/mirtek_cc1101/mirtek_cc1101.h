@@ -344,11 +344,21 @@ class MirtekCC1101 : public PollingComponent,
     cc_strobe_(CC_STX);
 
     // Ждём завершения передачи по GDO0 (IOCFG0=0x06: assert на sync, deassert
-    // по окончании пакета)
+    // по окончании пакета). delay(1)+feed_wdt() вместо delayMicroseconds() —
+    // последний не отдаёт управление планировщику FreeRTOS и не кормит
+    // task watchdog, из-за чего короткие ожидания незаметно складываются в
+    // цикле poll_all() (5 команд подряд) и roundtrip по RX ниже может
+    // спровоцировать сработку watchdog на реальном железе.
     if (gdo0_) {
       uint32_t t0 = millis();
-      while (!gdo0_->digital_read() && millis() - t0 < 200) delayMicroseconds(100);
-      while (gdo0_->digital_read() && millis() - t0 < 600) delayMicroseconds(100);
+      while (!gdo0_->digital_read() && millis() - t0 < 200) {
+        App.feed_wdt();
+        delay(1);
+      }
+      while (gdo0_->digital_read() && millis() - t0 < 600) {
+        App.feed_wdt();
+        delay(1);
+      }
     } else {
       delay(100);
     }
@@ -379,7 +389,14 @@ class MirtekCC1101 : public PollingComponent,
         cc_strobe_(CC_SFTX);
         cc_strobe_(CC_SRX);
       }
-      delayMicroseconds(500);
+      // App.feed_wdt() + delay(1) вместо delayMicroseconds(500): подтверждено
+      // реальным логом — с чистым delayMicroseconds() (busy-spin, без отдачи
+      // FreeRTOS) task watchdog у loopTask срабатывал примерно на 4-й
+      // секунде этого цикла и ESP32 уходил в reboot ("Task watchdog got
+      // triggered... Aborting"). 1 мс разрешения более чем достаточно —
+      // счётчик отвечает не быстрее, чем за миллисекунды.
+      App.feed_wdt();
+      delay(1);
     }
 
     if (raw_rx.empty()) {
