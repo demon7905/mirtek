@@ -140,14 +140,14 @@ class MirtekCC1101 : public PollingComponent,
     if (!ok) {
       ESP_LOGE(TAG, "CC1101 не обнаружен! Проверьте подключение SPI.");
     } else {
-      ESP_LOGI(TAG, "CC1101 готов. Интервал опроса: %u мс", get_update_interval());
+      ESP_LOGI(TAG, "CC1101 готов. Интервал опроса: %u мс", (unsigned) get_update_interval());
     }
   }
 
   void dump_config() override {
     ESP_LOGCONFIG(TAG, "Mirtek CC1101 Gateway (МИРТЕК-32-РУ):");
     ESP_LOGCONFIG(TAG, "  Адрес счётчика : %u", addr_);
-    ESP_LOGCONFIG(TAG, "  Интервал опроса: %u мс", get_update_interval());
+    ESP_LOGCONFIG(TAG, "  Интервал опроса: %u мс", (unsigned) get_update_interval());
     LOG_PIN("  GDO0 пин: ", gdo0_);
   }
 
@@ -483,7 +483,7 @@ class MirtekCC1101 : public PollingComponent,
         pub_txt_(TI_TYPE, "1ф 2х элементный активно-реактивный");
         break;
       default: {
-        char tb[24];
+        char tb[48];
         snprintf(tb, sizeof(tb), "тип 0x%02X (неизвестен)", tp);
         pub_txt_(TI_TYPE, tb);
         ESP_LOGW(TAG, "Неизвестный тип счётчика 0x%02X — оставляю three_phase=%d", tp, three_phase_);
@@ -492,7 +492,7 @@ class MirtekCC1101 : public PollingComponent,
     }
     pub_bin_(BI_3PH, three_phase_);
 
-    char tm[10], dt[12];
+    char tm[16], dt[16];
     snprintf(tm, sizeof(tm), "%02d:%02d:%02d", rbuf_[15], rbuf_[14], rbuf_[13]);
     snprintf(dt, sizeof(dt), "%02d.%02d.%02d", rbuf_[17], rbuf_[18], rbuf_[19]);
     pub_txt_(TI_TIME, tm);
