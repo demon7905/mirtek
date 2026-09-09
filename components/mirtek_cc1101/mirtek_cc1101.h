@@ -210,6 +210,9 @@ class MirtekCC1101 : public PollingComponent,
 
   // ── ESPHome lifecycle ───────────────────────────────────────────────────────
   void setup() override {
+    // До полной инициализации CC1101 никакие команды реле/пломб не отправляем.
+    initialized_ = false;
+
     // Уникальные ключи Preferences для адреса и интервала.
     // Адрес: uint16_t, интервал: uint32_t.
     pref_addr_ = global_preferences->make_preference<uint16_t>(0x4D523201);
@@ -250,8 +253,10 @@ class MirtekCC1101 : public PollingComponent,
     pub_txt_(TI_STATUS, ok ? "CC1101 OK" : "CC1101 ERR");
 
     if (!ok) {
+      initialized_ = false;
       ESP_LOGE(TAG, "CC1101 не обнаружен! Проверьте подключение SPI.");
     } else {
+      initialized_ = true;
       ESP_LOGI(TAG, "CC1101 готов. Интервал опроса: %u мс", (unsigned) get_update_interval());
     }
   }
@@ -293,12 +298,33 @@ class MirtekCC1101 : public PollingComponent,
 
   // ── Публичные методы ────────────────────────────────────────────────────────
   void poll_all() { update(); }
-  void relay_on() { queue_oneshot_(PH_RELAY_ON); }
-  void relay_off() { queue_oneshot_(PH_RELAY_OFF); }
-  void reset_seals() { queue_oneshot_(PH_SEAL_RESET); }
+  void relay_on() {
+    if (!initialized_) {
+      ESP_LOGW(TAG, "Relay ON пропущен: CC1101 ещё не инициализирован");
+      return;
+    }
+    queue_oneshot_(PH_RELAY_ON);
+  }
+
+  void relay_off() {
+    if (!initialized_) {
+      ESP_LOGW(TAG, "Relay OFF пропущен: CC1101 ещё не инициализирован");
+      return;
+    }
+    queue_oneshot_(PH_RELAY_OFF);
+  }
+
+  void reset_seals() {
+    if (!initialized_) {
+      ESP_LOGW(TAG, "SealReset пропущен: CC1101 ещё не инициализирован");
+      return;
+    }
+    queue_oneshot_(PH_SEAL_RESET);
+  }
 
  protected:
   GPIOPin *gdo0_{nullptr};
+  bool initialized_{false};
 
   uint16_t addr_{35040};
   bool three_phase_{true};
