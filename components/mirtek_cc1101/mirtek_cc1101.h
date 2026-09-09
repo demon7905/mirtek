@@ -320,7 +320,7 @@ class MirtekCC1101 : public PollingComponent,
   uint8_t pump_cmd_{0};
   int pump_expected_{0};
   int pump_got_{0};
-  uint32_t pump_t0_{0};      // старт общего RX-окна команды (лимит 10000 мс — TimerMs tmr(10000,0,0))
+  uint32_t pump_t0_{0};      // старт общего RX-окна команды (лимит 2000 мс — TimerMs tmr(2000,0,0))
   uint32_t pump_sub_t0_{0};  // старт текущего под-ожидания (фронт GDO0)
   bool pump_ok_{false};      // заголовок (адрес+эхо команды) сошёлся
   std::vector<uint8_t> tx_stuffed_;
@@ -542,7 +542,7 @@ class MirtekCC1101 : public PollingComponent,
         break;
       }
       case PS_RX_WAIT_HIGH: {
-        if (millis() - pump_t0_ > 10000) {  // TimerMs tmr(10000,0,0) из packetReceiver()
+        if (millis() - pump_t0_ > 2000) {  // TimerMs tmr(2000,0,0) из packetReceiver()
           finish_pump_();
           return;
         }
@@ -565,7 +565,7 @@ class MirtekCC1101 : public PollingComponent,
         if (!gdo0_->digital_read() || millis() - pump_sub_t0_ > 200) {
           ESP_LOGV(TAG, "GDO0 LOW (RX подпакет %d/%d принят)", pump_got_ + 1, pump_expected_);
           read_burst_and_rearm_();
-        } else if (millis() - pump_t0_ > 10000) {
+        } else if (millis() - pump_t0_ > 2000) {
           finish_pump_();
         }
         break;
