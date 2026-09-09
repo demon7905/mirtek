@@ -511,12 +511,21 @@ class MirtekCC1101 : public PollingComponent,
         break;
       }
       case PS_RX_WAIT_LOW: {
-        // Эквивалент CheckReceiveFlag(): ждём спад GDO0, но не дольше 200мс
-        // — по достижении любого из условий пакет считается готовым к
-        // чтению (ровно так делает реальная библиотека).
-        if (!gdo0_->digital_read() || millis() - pump_sub_t0_ > 200) {
-          ESP_LOGV(TAG, "GDO0 LOW (RX подпакет %d/%d принят)", pump_got_ + 1, pump_expected_);
+        // Эквивалент CheckReceiveFlag():
+        // ждём фактического перехода GDO0 HIGH -> LOW.
+        //
+        // Если GDO0 не опустился за 200 мс — это ошибка приёма,
+        // а не успешно принятый пакет.
+        if (!gdo0_->digital_read()) {
+          ESP_LOGV(TAG, "GDO0 LOW (RX подпакет %d/%d принят)",
+                   pump_got_ + 1, pump_expected_);
           read_burst_and_rearm_();
+        } else if (millis() - pump_sub_t0_ > 200) {
+          ESP_LOGW(TAG,
+                   "RX timeout: GDO0 не опустился за 200 мс "
+                   "(подпакет %d/%d)",
+                   pump_got_ + 1, pump_expected_);
+          finish_pump_();
         } else if (millis() - pump_t0_ > 10000) {
           finish_pump_();
         }
