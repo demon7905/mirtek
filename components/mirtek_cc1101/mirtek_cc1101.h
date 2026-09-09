@@ -35,9 +35,10 @@
 //  update(). Приём RF-пакетов (до 10с суммарно) размазан по вызовам loop()
 //  — каждый тик проверяется GDO0/таймаут и делается минимум работы, loop()
 //  почти всегда возвращается за микросекунды. Коротким ожиданиям аппаратной
-//  settle-задержки (SCAL ~2мс, детект фронта GDO0 при TX ≤800мс суммарно)
+//  settle-задержки (SCAL ~2мс, детект фронта GDO0 при TX ≤1000мс суммарно —
+//  два ожидания по 500мс каждое, подтверждено по SmartRC_CC1101::SendData())
 //  оставлено короткое блокирующее ожидание с App.feed_wdt() внутри — это
-//  сознательный компромисс, не наводнение stateʼами на 800мс ожидания,
+//  сознательный компромисс, не наводнение stateʼами на 1000мс ожидания,
 //  которое не может привести к срабатыванию watchdog (5с) и не заметно
 //  для API/WiFi/OTA. Приём RF-подпакетов (до 10с) — вот что ОБЯЗАТЕЛЬНО
 //  размазано по тикам, и это сделано.
@@ -467,10 +468,12 @@ class MirtekCC1101 : public PollingComponent,
   void pump_tick_() {
     switch (pump_state_) {
       case PS_TX_WAIT_HIGH: {
-        // Ждём фронт GDO0 вверх (синхрослово ушло). Короткое ограниченное
-        // ожидание (≤200мс) с feed_wdt — не тот блокирующий 10-секундный
-        // цикл, что вызвал watchdog reset; здесь предел на порядок меньше.
-        if (!gdo0_ || gdo0_->digital_read() || millis() - pump_sub_t0_ > 200) {
+        // Ждём фронт GDO0 вверх (синхрослово ушло) — предел 500мс, взят
+        // напрямую из SmartRC_CC1101::SendData(): `while (!digitalRead(GDO0)
+        // && (millis()-start<500));`. Раньше здесь стояло 200/600 —
+        // непроверенные числа из более раннего поиска; сейчас поправлено
+        // на подтверждённые 500/500 из реального исходника.
+        if (!gdo0_ || gdo0_->digital_read() || millis() - pump_sub_t0_ > 500) {
           ESP_LOGV(TAG, "GDO0 HIGH (TX sync отправлен)");
           pump_sub_t0_ = millis();
           pump_state_ = PS_TX_WAIT_LOW;
@@ -478,8 +481,9 @@ class MirtekCC1101 : public PollingComponent,
         break;
       }
       case PS_TX_WAIT_LOW: {
-        // Ждём фронт GDO0 вниз (конец TX-пакета) — как в SendData().
-        if (!gdo0_ || !gdo0_->digital_read() || millis() - pump_sub_t0_ > 600) {
+        // Ждём фронт GDO0 вниз (конец TX-пакета) — тот же SendData(),
+        // второй `while (digitalRead(GDO0) && (millis()-start<500));`.
+        if (!gdo0_ || !gdo0_->digital_read() || millis() - pump_sub_t0_ > 500) {
           ESP_LOGV(TAG, "GDO0 LOW (TX завершён)");
           cc_strobe_(CC_SFRX);
           cc_strobe_(CC_SRX);
