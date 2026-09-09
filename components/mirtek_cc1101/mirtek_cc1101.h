@@ -453,10 +453,21 @@ class MirtekCC1101 : public PollingComponent,
     cc_strobe_(CC_SIDLE);
     cc_wreg_(CC_PATABLE, CC_PATABLE_VALUE);
 
+    // Полностью повторяем SmartRC SendData():
+    // 1. Сначала отдельная запись длины в TXFIFO
+    cc_wreg_(CC_TXFIFO, static_cast<uint8_t>(tx_stuffed_.size()));
+
+    // 2. Затем сам пакет burst-записью
     this->enable();
     this->transfer_byte(CC_TXFIFO | CC_BURST);
-    for (uint8_t b : tx_stuffed_) this->transfer_byte(b);
+
+    for (uint8_t b : tx_stuffed_) {
+      this->transfer_byte(b);
+    }
+
     this->disable();
+
+    // 3. Передача
     cc_strobe_(CC_STX);
 
     pump_sub_t0_ = millis();
