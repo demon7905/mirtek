@@ -31,7 +31,6 @@
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/number/number.h"
-#include "esphome/components/mqtt/mqtt_client.h"
 
 #include <vector>
 #include <cstdio>
@@ -154,6 +153,15 @@ class MirtekCC1101 : public PollingComponent,
       a = 65535;
 
     addr_ = static_cast<uint16_t>(a);
+
+    // template number может вызвать set_action во время своего setup(),
+    // раньше setup() этого компонента. В этот момент pref_addr_ ещё не
+    // инициалирован — сохранять в Preferences нельзя.
+    if (!initialized_) {
+      ESP_LOGI(TAG, "Адрес %u принят до инициализации; сохранение отложено", addr_);
+      return;
+    }
+
     if (pref_addr_.save(&addr_)) {
       ESP_LOGI(TAG, "Адрес счётчика изменён и сохранён: %u", addr_);
     } else {
@@ -163,8 +171,6 @@ class MirtekCC1101 : public PollingComponent,
     if (address_number_ != nullptr) {
       address_number_->publish_state(static_cast<float>(addr_));
     }
-
-    update_mqtt_topics_(true);
   }
 
   void set_address_number(number::Number *n) {
@@ -181,6 +187,14 @@ class MirtekCC1101 : public PollingComponent,
 
     const uint32_t ms = static_cast<uint32_t>(seconds * 1000.0f);
     poll_interval_ms_ = ms;
+
+    // До setup() Preferences ещё не подготовлены. Значение принимаем в RAM,
+    // но запись во flash выполняем только после полной инициализации.
+    if (!initialized_) {
+      ESP_LOGI(TAG, "Интервал %.0f сек принят до инициализации; сохранение отложено", seconds);
+      return;
+    }
+
     this->set_update_interval(ms);
     this->stop_poller();
     this->start_poller();
@@ -193,72 +207,6 @@ class MirtekCC1101 : public PollingComponent,
 
     if (interval_number_ != nullptr) {
       interval_number_->publish_state(seconds);
-    }
-  }
-
-  // Обновляет MQTT-префикс, availability и подписку на cmd в соответствии с адресом.
-  // При live-изменении адреса переподключаем MQTT, чтобы Home Assistant получил
-  // новые discovery/state topics, а старые topics перестали быть активными.
-  void update_mqtt_topics_(bool reconnect) {
-    if (mqtt::global_mqtt_client == nullptr)
-      return;
-
-    const std::string old_base = mqtt_topic_base_;
-    const std::string new_base = std::string("mirtek/") + std::to_string(addr_);
-    const std::string new_cmd_topic = new_base + "/cmd";
-    const std::string new_status_topic = new_base + "/status";
-
-    if (reconnect && old_base != new_base) {
-      mqtt::global_mqtt_client->disable();
-    }
-
-    if (!mqtt_cmd_topic_.empty() && mqtt_cmd_topic_ != new_cmd_topic) {
-      mqtt::global_mqtt_client->unsubscribe(mqtt_cmd_topic_);
-    }
-
-    mqtt::global_mqtt_client->set_topic_prefix(new_base, App.get_name());
-
-    mqtt::MQTTMessage birth;
-    birth.topic = new_status_topic;
-    birth.payload = "online";
-    birth.qos = 0;
-    birth.retain = true;
-    mqtt::global_mqtt_client->set_birth_message(std::move(birth));
-
-    mqtt::MQTTMessage will;
-    will.topic = new_status_topic;
-    will.payload = "offline";
-    will.qos = 0;
-    will.retain = true;
-    mqtt::global_mqtt_client->set_last_will(std::move(will));
-
-    mqtt::MQTTMessage shutdown;
-    shutdown.topic = new_status_topic;
-    shutdown.payload = "offline";
-    shutdown.qos = 0;
-    shutdown.retain = true;
-    mqtt::global_mqtt_client->set_shutdown_message(std::move(shutdown));
-
-    mqtt_cmd_topic_ = new_cmd_topic;
-    mqtt_topic_base_ = new_base;
-
-    mqtt::global_mqtt_client->subscribe(
-        mqtt_cmd_topic_,
-        [this](const std::string &, const std::string &payload) {
-          int v = atoi(payload.c_str());
-          if (v == 1)
-            this->poll_all();
-          else if (v == 8)
-            this->relay_on();
-          else if (v == 9)
-            this->relay_off();
-          else if (v == 4)
-            this->reset_seals();
-        },
-        0);
-
-    if (reconnect && old_base != new_base) {
-      mqtt::global_mqtt_client->enable();
     }
   }
 
@@ -309,10 +257,6 @@ class MirtekCC1101 : public PollingComponent,
       interval_number_->publish_state(static_cast<float>(poll_interval_ms_) / 1000.0f);
     }
 
-    // MQTT настраивается до его подключения: topic_prefix, availability и cmd
-    // сразу соответствуют сохранённому адресу счётчика.
-    update_mqtt_topics_(false);
-
     ESP_LOGI(TAG, "Инициализация CC1101, адрес счётчика=%u, интервал=%u мс",
              addr_, (unsigned) poll_interval_ms_);
 
@@ -324,11 +268,13 @@ class MirtekCC1101 : public PollingComponent,
     pub_bin_(BI_CC, ok);
     pub_txt_(TI_STATUS, ok ? "CC1101 OK" : "CC1101 ERR");
 
+    // Только после завершения setup() разрешаем команды реле/пломб и запись
+    // пользовательских настроек в Preferences.
+    initialized_ = ok;
+
     if (!ok) {
-      initialized_ = false;
       ESP_LOGE(TAG, "CC1101 не обнаружен! Проверьте подключение SPI.");
     } else {
-      initialized_ = true;
       ESP_LOGI(TAG, "CC1101 готов. Интервал опроса: %u мс", (unsigned) get_update_interval());
     }
   }
@@ -372,7 +318,7 @@ class MirtekCC1101 : public PollingComponent,
   void poll_all() { update(); }
   void relay_on() {
     if (!initialized_) {
-      ESP_LOGW(TAG, "Relay ON пропущен: Mirtek CC1101 ещё не инициализирован");
+      ESP_LOGW(TAG, "Relay ON пропущен: CC1101 ещё не инициализирован");
       return;
     }
     queue_oneshot_(PH_RELAY_ON);
@@ -380,7 +326,7 @@ class MirtekCC1101 : public PollingComponent,
 
   void relay_off() {
     if (!initialized_) {
-      ESP_LOGW(TAG, "Relay OFF пропущен: Mirtek CC1101 ещё не инициализирован");
+      ESP_LOGW(TAG, "Relay OFF пропущен: CC1101 ещё не инициализирован");
       return;
     }
     queue_oneshot_(PH_RELAY_OFF);
@@ -388,7 +334,7 @@ class MirtekCC1101 : public PollingComponent,
 
   void reset_seals() {
     if (!initialized_) {
-      ESP_LOGW(TAG, "Reset seals пропущен: Mirtek CC1101 ещё не инициализирован");
+      ESP_LOGW(TAG, "Сброс пломб пропущен: CC1101 ещё не инициализирован");
       return;
     }
     queue_oneshot_(PH_SEAL_RESET);
@@ -408,9 +354,6 @@ class MirtekCC1101 : public PollingComponent,
 
   ESPPreferenceObject pref_addr_;
   ESPPreferenceObject pref_interval_;
-
-  std::string mqtt_topic_base_;
-  std::string mqtt_cmd_topic_;
 
   sensor::Sensor *ss_[SI_COUNT]{};
   text_sensor::TextSensor *ts_[TI_COUNT]{};
