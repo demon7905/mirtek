@@ -176,12 +176,20 @@ class MirtekCC1101 : public PollingComponent,
   }
 
   // ── ESPHome lifecycle ───────────────────────────────────────────────────────
+  // Приоритет BUS (1000) — выше, чем у TemplateSwitch (HARDWARE-2 = 798) и
+  // прочих логических компонентов. Обнаружено на реальном логе: switch с
+  // restore_value при своём setup() дёргал relay_off() ДО того, как этот
+  // компонент успевал вызвать spi_setup() — SPI-транзакции падали с
+  // "SPIDevice not initialised". BUS гарантирует, что мы поднимаемся первыми.
+  float get_setup_priority() const override { return setup_priority::BUS; }
+
   void setup() override {
     ESP_LOGI(TAG, "Инициализация CC1101, адрес счётчика=%u", addr_);
     this->spi_setup();
     if (gdo0_) gdo0_->setup();
 
     bool ok = cc_init_();
+    cc_ready_ = ok;  // до этого момента команды не принимаются — см. start_phase_()
     pub_bin_(BI_CC, ok);
     pub_txt_(TI_STATUS, ok ? "CC1101 OK" : "CC1101 ERR");
 
@@ -280,6 +288,7 @@ class MirtekCC1101 : public PollingComponent,
   GPIOPin *gdo0_{nullptr};
   uint16_t addr_{1};
   bool three_phase_{true};  // по умолчанию 3ф, как в My_Mirtek_Demon.ino; уточняется командой 0x1C
+  bool cc_ready_{false};    // true только после успешного cc_init_() в setup()
 
   sensor::Sensor *ss_[SI_COUNT]{};
   text_sensor::TextSensor *ts_[TI_COUNT]{};
@@ -416,6 +425,16 @@ class MirtekCC1101 : public PollingComponent,
 
   // ── Запуск шага цикла (или one-shot команды) ──────────────────────────────────
   void start_phase_(Phase ph) {
+    if (!cc_ready_) {
+      // Защита от гонки setup(): если что-то (switch с restore_value,
+      // HA-сервис и т.п.) попросит команду до того, как CC1101 сам
+      // проинициализировался — не лезем в SPI, а просто пропускаем.
+      // С BUS-приоритетом выше такого штатно не должно случаться, но
+      // это дешёвая страховка на случай будущих изменений конфигурации.
+      ESP_LOGW(TAG, "CC1101 ещё не готов — команда (фаза=%d) пропущена", (int) ph);
+      phase_ = PH_IDLE;
+      return;
+    }
     phase_ = ph;
     switch (ph) {
       case PH_DATETIME:     begin_command_(0x1C, -1, -1, 3); break;
