@@ -48,6 +48,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
+#include "esphome/core/automation.h"
 #include "esphome/components/spi/spi.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
@@ -175,6 +176,13 @@ class MirtekCC1101 : public PollingComponent,
     if (i >= 0 && i < BI_COUNT) bs_[i] = s;
   }
 
+  // ── Для MQTT-снапшота с динамическим топиком (текущий адрес счётчика) ──────
+  uint16_t get_meter_address() const { return addr_; }
+  std::string get_last_snapshot_json() const { return last_snapshot_json_; }
+  void add_on_poll_complete_callback(std::function<void()> cb) {
+    poll_complete_callback_.add(std::move(cb));
+  }
+
   // ── ESPHome lifecycle ───────────────────────────────────────────────────────
   // Приоритет BUS (1000) — выше, чем у TemplateSwitch (HARDWARE-2 = 798) и
   // прочих логических компонентов. Обнаружено на реальном логе: switch с
@@ -244,6 +252,10 @@ class MirtekCC1101 : public PollingComponent,
     if (finished == PH_STATUS) {
       pub_txt_(TI_STATUS, poll_ok_accum_ ? "OK" : "PARTIAL");
       ESP_LOGI(TAG, "=== Опрос завершён: %s ===", poll_ok_accum_ ? "OK" : "PARTIAL");
+      // Снапшот и колбэк — только для обычного цикла опроса (не для
+      // one-shot команд реле/пломб, у них нет набора показаний).
+      build_snapshot_json_();
+      poll_complete_callback_.call();
     }
     phase_ = PH_IDLE;
     // Пауза между запросами убрана — в скетче её нет, timing определяется
@@ -293,6 +305,15 @@ class MirtekCC1101 : public PollingComponent,
   sensor::Sensor *ss_[SI_COUNT]{};
   text_sensor::TextSensor *ts_[TI_COUNT]{};
   binary_sensor::BinarySensor *bs_[BI_COUNT]{};
+
+  // Внутренний кэш последних значений — заполняется в pub_s_/pub_txt_/
+  // pub_bin_ независимо от того, добавлен ли соответствующий HA-сенсор,
+  // используется build_snapshot_json_() для MQTT-снапшота.
+  float last_s_[SI_COUNT]{};
+  std::string last_t_[TI_COUNT];
+  bool last_b_[BI_COUNT]{};
+  std::string last_snapshot_json_;
+  CallbackManager<void()> poll_complete_callback_;
 
   uint8_t sbuf_[24]{};
   uint8_t rbuf_[64]{};
@@ -771,14 +792,54 @@ class MirtekCC1101 : public PollingComponent,
     return neg ? -v : v;
   }
 
+  // Публикация ЗАРАЗ и в опциональный HA-сенсор (если сконфигурирован в
+  // YAML), и во внутренний кэш last_s_/last_t_/last_b_ — кэш используется
+  // для JSON-снапшота в build_snapshot_json_(), чтобы туда попадали ВСЕ
+  // значения независимо от того, какие сенсоры пользователь включил.
   void pub_s_(int i, float v) {
+    last_s_[i] = v;
     if (ss_[i]) ss_[i]->publish_state(v);
   }
   void pub_txt_(int i, const std::string &v) {
+    last_t_[i] = v;
     if (ts_[i]) ts_[i]->publish_state(v);
   }
   void pub_bin_(int i, bool v) {
+    last_b_[i] = v;
     if (bs_[i]) bs_[i]->publish_state(v);
+  }
+
+  // JSON-снапшот всех текущих показаний — публикуется в MQTT-топик,
+  // который включает ТЕКУЩИЙ адрес счётчика (в отличие от entity-топиков
+  // самого ESPHome, которые статичны и завязаны на device_name). Так при
+  // смене адреса через HA данные разных счётчиков не попадают в один и
+  // тот же топик.
+  void build_snapshot_json_() {
+    char buf[900];
+    int n = snprintf(
+        buf, sizeof(buf),
+        "{\"address\":%u,\"status\":\"%s\",\"three_phase\":%s,"
+        "\"tariff\":\"%s\",\"sum_kwh\":%.2f,\"t1_kwh\":%.2f,\"t2_kwh\":%.2f,"
+        "\"power_w\":%.0f,\"reactive_kvar\":%.3f,\"freq_hz\":%.2f,\"pf\":%.3f,"
+        "\"u1\":%.1f,\"u2\":%.1f,\"u3\":%.1f,\"i1\":%.3f,\"i2\":%.3f,\"i3\":%.3f,"
+        "\"pa_w\":%.0f,\"pb_w\":%.0f,\"pc_w\":%.0f,"
+        "\"qa_kvar\":%.3f,\"qb_kvar\":%.3f,\"qc_kvar\":%.3f,"
+        "\"sa_va\":%.0f,\"sb_va\":%.0f,\"sc_va\":%.0f,"
+        "\"pfa\":%.3f,\"pfb\":%.3f,\"pfc\":%.3f,\"temp_c\":%.0f,"
+        "\"relay\":\"%s\",\"seal\":\"%s\",\"meter_type\":\"%s\","
+        "\"meter_date\":\"%s\",\"meter_time\":\"%s\"}",
+        addr_, last_t_[TI_STATUS].c_str(), three_phase_ ? "true" : "false", last_t_[TI_TARIFF].c_str(),
+        last_s_[SI_SUM], last_s_[SI_T1], last_s_[SI_T2], last_s_[SI_KW], last_s_[SI_KVAR], last_s_[SI_FREQ],
+        last_s_[SI_COS], last_s_[SI_V1], last_s_[SI_V2], last_s_[SI_V3], last_s_[SI_I1], last_s_[SI_I2],
+        last_s_[SI_I3], last_s_[SI_PA], last_s_[SI_PB], last_s_[SI_PC], last_s_[SI_QA], last_s_[SI_QB],
+        last_s_[SI_QC], last_s_[SI_SA], last_s_[SI_SB], last_s_[SI_SC], last_s_[SI_CA], last_s_[SI_CB],
+        last_s_[SI_CC], last_s_[SI_TEMP], last_t_[TI_RELAY].c_str(), last_t_[TI_SEAL].c_str(),
+        last_t_[TI_TYPE].c_str(), last_t_[TI_DATE].c_str(), last_t_[TI_TIME].c_str());
+    if (n > 0 && static_cast<size_t>(n) < sizeof(buf)) {
+      last_snapshot_json_ = std::string(buf, n);
+    } else {
+      ESP_LOGW(TAG, "JSON-снапшот не поместился в буфер (%d байт)", n);
+    }
   }
 
   // ── Парсеры ответов — все смещения взяты из packetParser_1..6 в
@@ -907,6 +968,16 @@ class MirtekCC1101 : public PollingComponent,
     pub_bin_(BI_SEAL, seal_ok);
     ESP_LOGI(TAG, "Реле=%s Пломбы=%s", relay_off ? "Выкл" : "Вкл", seal_str);
     return true;
+  }
+};
+
+// Триггер on_poll_complete: срабатывает после каждого успешного завершения
+// цикла опроса (после парсинга 0x10). Используется в YAML для публикации
+// JSON-снапшота в MQTT-топик, включающий ТЕКУЩИЙ адрес счётчика.
+class MirtekOnPollCompleteTrigger : public Trigger<> {
+ public:
+  explicit MirtekOnPollCompleteTrigger(MirtekCC1101 *parent) {
+    parent->add_on_poll_complete_callback([this]() { this->trigger(); });
   }
 };
 
