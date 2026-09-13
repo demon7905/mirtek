@@ -12,7 +12,8 @@ Mirtek STAR 104/304 (см. комментарии в mirtek_cc1101.h).
 """
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome import pins
+from esphome import automation, pins
+from esphome.const import CONF_TRIGGER_ID
 from esphome.components import spi, sensor, text_sensor, binary_sensor
 from esphome.const import (
     CONF_ID,
@@ -98,9 +99,14 @@ CONF_B_RELAY = "relay_on"
 CONF_B_SEAL = "seal_ok"
 CONF_B_CC = "cc1101_ok"
 
+CONF_ON_POLL_COMPLETE = "on_poll_complete"
+
 # ── C++ класс ────────────────────────────────────────────────────────────────
 mirtek_ns = cg.esphome_ns.namespace("mirtek_cc1101")
 MirtekCC1101 = mirtek_ns.class_("MirtekCC1101", cg.PollingComponent, spi.SPIDevice)
+MirtekOnPollCompleteTrigger = mirtek_ns.class_(
+    "MirtekOnPollCompleteTrigger", automation.Trigger.template()
+)
 
 
 def _sensor(unit, decimals, device_class=None, state_class=STATE_CLASS_MEASUREMENT, icon=None):
@@ -175,6 +181,12 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_B_RELAY): binary_sensor.binary_sensor_schema(device_class=DEVICE_CLASS_POWER),
             cv.Optional(CONF_B_SEAL): binary_sensor.binary_sensor_schema(device_class=DEVICE_CLASS_SAFETY),
             cv.Optional(CONF_B_CC): binary_sensor.binary_sensor_schema(device_class=DEVICE_CLASS_CONNECTIVITY),
+            # ── Триггер: конец каждого успешного цикла опроса ────────────────
+            cv.Optional(CONF_ON_POLL_COMPLETE): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(MirtekOnPollCompleteTrigger),
+                }
+            ),
         }
     )
     .extend(spi.spi_device_schema(cs_pin_required=True))
@@ -224,3 +236,7 @@ async def to_code(config):
         if bs_config := config.get(key):
             bs = await binary_sensor.new_binary_sensor(bs_config)
             cg.add(var.set_binary_sensor(idx, bs))
+
+    for conf in config.get(CONF_ON_POLL_COMPLETE, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trigger, [], conf)
