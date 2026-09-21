@@ -24,6 +24,7 @@ from esphome.const import (
     DEVICE_CLASS_FREQUENCY,
     DEVICE_CLASS_POWER_FACTOR,
     DEVICE_CLASS_TEMPERATURE,
+    DEVICE_CLASS_SIGNAL_STRENGTH,
     DEVICE_CLASS_CONNECTIVITY,
     DEVICE_CLASS_SAFETY,
     STATE_CLASS_MEASUREMENT,
@@ -34,6 +35,7 @@ from esphome.const import (
     UNIT_WATT,
     UNIT_HERTZ,
     UNIT_CELSIUS,
+    UNIT_DECIBEL_MILLIWATT,
     UNIT_EMPTY,
     UNIT_KILOVOLT_AMPS_REACTIVE,
     UNIT_VOLT_AMPS,
@@ -83,6 +85,7 @@ CONF_S_CA = "pf_a"
 CONF_S_CB = "pf_b"
 CONF_S_CC = "pf_c"
 CONF_S_TEMP = "temperature"
+CONF_S_RSSI = "cc1101_rssi"
 
 # Текстовые датчики
 CONF_T_TARIFF = "tariff"
@@ -168,6 +171,9 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_S_CB): _sensor(UNIT_EMPTY, 3),
             cv.Optional(CONF_S_CC): _sensor(UNIT_EMPTY, 3),
             cv.Optional(CONF_S_TEMP): _sensor(UNIT_CELSIUS, 0, DEVICE_CLASS_TEMPERATURE, icon=ICON_THERMOMETER),
+            cv.Optional(CONF_S_RSSI): _sensor(
+                UNIT_DECIBEL_MILLIWATT, 0, DEVICE_CLASS_SIGNAL_STRENGTH, icon="mdi:signal"
+            ),
             # ── Текстовые датчики ─────────────────────────────────────────────
             cv.Optional(CONF_T_TARIFF): text_sensor.text_sensor_schema(),
             cv.Optional(CONF_T_RELAY): text_sensor.text_sensor_schema(),
@@ -214,6 +220,7 @@ async def to_code(config):
         CONF_S_SA, CONF_S_SB, CONF_S_SC,
         CONF_S_CA, CONF_S_CB, CONF_S_CC,
         CONF_S_TEMP,
+        CONF_S_RSSI,
     ]
     for idx, key in enumerate(SENSORS):
         if sensor_config := config.get(key):
