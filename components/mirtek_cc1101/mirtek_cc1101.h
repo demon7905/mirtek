@@ -99,6 +99,11 @@ static const uint8_t CC_TXFIFO = 0x3F;
 static const uint8_t CC_RXFIFO = 0x3F;
 static const uint8_t CC_RXBYTES = 0x3B;  // Status reg: bytes in RX FIFO (диагностика, не триггер)
 static const uint8_t CC_VERSION = 0x31;  // Status reg: chip version
+static const uint8_t CC_RSSI = 0x34;     // Status reg: RSSI последнего принятого пакета
+// Стандартное смещение из TI datasheet CC1101 (п. 17.3, RSSI Offset) для
+// большинства конфигураций скорости — не откалибровано отдельно именно под
+// наш RF_CFG, это стандартное приближение, не точное измерение.
+static const int RSSI_OFFSET_DBM = 74;
 
 // TX-мощность, выставляется перед каждой отправкой — как в packetSender()
 // рабочего скетча ("выставляем мощность 10dB"). Значение 0xC4 не
@@ -128,6 +133,7 @@ enum SensorIdx {
   SI_SA, SI_SB, SI_SC,
   SI_CA, SI_CB, SI_CC,
   SI_TEMP,
+  SI_RSSI,
   SI_COUNT
 };
 
@@ -676,6 +682,15 @@ class MirtekCC1101 : public PollingComponent,
     this->disable();
     ESP_LOGV(TAG, "RX status (подпакет %d/%d, не используется): %02X %02X", pump_got_ + 1, pump_expected_,
               status[0], status[1]);
+
+    // RSSI берём из ОТДЕЛЬНОГО статусного регистра CC1101 (0x34), а НЕ из
+    // status[0]/status[1] выше — у нас в RF_CFG APPEND_STATUS выключен
+    // (PKTCTRL1=0x00), так что эти 2 байта не настоящий RSSI/LQI. Регистр
+    // 0x34 при этом всё равно валиден — AGC continuously обновляет его
+    // независимо от APPEND_STATUS.
+    uint8_t rssi_raw = cc_rstat_(CC_RSSI);
+    int rssi_dbm = (rssi_raw >= 128) ? (static_cast<int>(rssi_raw) - 256) : static_cast<int>(rssi_raw);
+    pub_s_(SI_RSSI, rssi_dbm / 2.0f - RSSI_OFFSET_DBM);
 
     for (uint8_t i = 1; i < outer_len; i++) pump_raw_rx_.push_back(burst[i]);
   }
