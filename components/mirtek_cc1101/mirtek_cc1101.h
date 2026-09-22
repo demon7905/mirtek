@@ -337,7 +337,7 @@ class MirtekCC1101 : public PollingComponent,
   // железе — это НЕ перенос из скетча, а явное осознанное отклонение от
   // него. Если счётчик когда-нибудь будет отвечать медленнее 2с, команда
   // будет считаться неотвеченной раньше, чем в оригинале.
-  static constexpr uint32_t RX_TIMEOUT_MS = 1000;
+  static constexpr uint32_t RX_TIMEOUT_MS = 2000;
 
   // "насос" одной команды
   PumpState pump_state_{PS_IDLE};
