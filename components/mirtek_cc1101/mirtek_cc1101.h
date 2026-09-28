@@ -190,7 +190,7 @@ class MirtekCC1101 : public PollingComponent,
   }
 
   // ── ESPHome lifecycle ───────────────────────────────────────────────────────
-  // Приоритет BUS (1000) — выше, чем у TemplateSwitch (HARDWARE-2 = 798) и
+  // Приоритет BUS () — выше, чем у TemplateSwitch (HARDWARE-2 = 798) и
   // прочих логических компонентов. Обнаружено на реальном логе: switch с
   // restore_value при своём setup() дёргал relay_off() ДО того, как этот
   // компонент успевал вызвать spi_setup() — SPI-транзакции падали с
@@ -337,7 +337,7 @@ class MirtekCC1101 : public PollingComponent,
   // железе — это НЕ перенос из скетча, а явное осознанное отклонение от
   // него. Если счётчик когда-нибудь будет отвечать медленнее 2с, команда
   // будет считаться неотвеченной раньше, чем в оригинале.
-  static constexpr uint32_t RX_TIMEOUT_MS = 1000;
+  static constexpr uint32_t RX_TIMEOUT_MS = 500;
 
   // "насос" одной команды
   PumpState pump_state_{PS_IDLE};
